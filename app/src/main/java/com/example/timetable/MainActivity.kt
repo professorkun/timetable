@@ -1,8 +1,16 @@
 package com.example.timetable
 
+import android.Manifest
+import android.app.AlarmManager
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.os.Bundle
 import android.util.Base64
 import android.content.Context
+import android.content.Intent
+import android.os.Build
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -42,6 +50,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -63,6 +72,7 @@ import java.util.zip.InflaterInputStream
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Calendar
+import androidx.core.app.NotificationCompat
 
 /**
  * 课程表的列标题。一周固定显示七天，即使周末暂时没有课程也保留空格。
@@ -139,6 +149,10 @@ private val courseCatalog = listOf(
  */
 private val initialCourses = loadImportedCourses()
 
+private const val REMINDER_CHANNEL_ID = "class_reminders"
+private const val REMINDER_ACTION = "com.example.timetable.CLASS_REMINDER"
+private const val REMINDER_LEAD_MINUTES = 40
+
 /** 本地保存手动课程使用的文件名和键名。数据只保存在本机，不会上传网络。 */
 private const val LOCAL_PREFS = "timetable_local_data"
 private const val MANUAL_COURSES_KEY = "manual_courses"
@@ -201,6 +215,86 @@ private fun saveCourses(context: Context, courses: List<CourseEntry>) {
         .apply()
 }
 
+/** 将节次转换为当天分钟数，用于计算“上课前 40 分钟”的通知时间。 */
+private val periodStartMinutes = listOf(510, 560, 625, 675, 840, 890, 945, 995, 1080, 1125, 1170, 1215)
+
+private fun createReminderChannel(context: Context) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val channel = NotificationChannel(
+            REMINDER_CHANNEL_ID,
+            "课程提醒",
+            NotificationManager.IMPORTANCE_HIGH,
+        ).apply { description = "上课前 40 分钟提醒课程和教室" }
+        context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+}
+
+/** 为每个周次、星期和时段安排一条通知；没有课程的时段不会创建通知。 */
+private fun scheduleClassReminders(context: Context, courses: List<CourseEntry>) {
+    val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+    val now = System.currentTimeMillis()
+    var requestCode = 1000
+    val segments = listOf(
+        Triple("上午", 1, 4),
+        Triple("下午", 5, 8),
+        Triple("晚上", 9, 12),
+    )
+
+    for (week in 1..TOTAL_WEEKS) {
+        for (day in weekdays.indices) {
+            for ((segmentName, firstPeriod, lastPeriod) in segments) {
+                val segmentCourses = courses
+                    .filter { it.week == week && it.day == day + 1 && it.startPeriod in firstPeriod..lastPeriod }
+                    .sortedBy { it.startPeriod }
+                val firstCourse = segmentCourses.firstOrNull() ?: continue
+                val firstStart = periodStartMinutes[firstCourse.startPeriod - 1]
+                val date = Calendar.getInstance().apply {
+                    set(SEMESTER_START_YEAR, SEMESTER_START_MONTH, SEMESTER_START_DAY, firstStart / 60, firstStart % 60, 0)
+                    set(Calendar.MILLISECOND, 0)
+                    add(Calendar.DAY_OF_YEAR, (week - 1) * weekdays.size + day)
+                    add(Calendar.MINUTE, -REMINDER_LEAD_MINUTES)
+                }
+                if (date.timeInMillis <= now) {
+                    requestCode += 1
+                    continue
+                }
+                val courseText = segmentCourses.joinToString("；") { "${it.course.name}（${it.course.place}）" }
+                val intent = Intent(context, ReminderReceiver::class.java).apply {
+                    action = REMINDER_ACTION
+                    putExtra("notificationId", requestCode)
+                    putExtra("title", "40分钟后上课 · $segmentName")
+                    putExtra("text", courseText)
+                }
+                val pendingIntent = PendingIntent.getBroadcast(
+                    context,
+                    requestCode,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                )
+                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, date.timeInMillis, pendingIntent)
+                requestCode += 1
+            }
+        }
+    }
+}
+
+/** 系统到点后接收闹钟，并显示课程提醒通知。 */
+class ReminderReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        createReminderChannel(context)
+        val notification = NotificationCompat.Builder(context, REMINDER_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_popup_reminder)
+            .setContentTitle(intent.getStringExtra("title") ?: "课程提醒")
+            .setContentText(intent.getStringExtra("text") ?: "请查看课程表")
+            .setStyle(NotificationCompat.BigTextStyle().bigText(intent.getStringExtra("text") ?: "请查看课程表"))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .build()
+        val id = intent.getIntExtra("notificationId", 1)
+        context.getSystemService(NotificationManager::class.java).notify(id, notification)
+    }
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -214,6 +308,15 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 fun TimetableApp() {
     val context = LocalContext.current
+    LaunchedEffect(Unit) {
+        createReminderChannel(context)
+        scheduleClassReminders(context, initialCourses + loadSavedCourses(context))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            (context as? ComponentActivity)?.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
+        }
+    }
     // 固定导入课表与用户手动添加的课程分开管理；手动课程从本地恢复，重启后仍然存在。
     var manualCourses by remember { mutableStateOf(loadSavedCourses(context)) }
     val courses = initialCourses + manualCourses
@@ -304,6 +407,7 @@ fun TimetableApp() {
                 val newCourse = CourseEntry(currentWeek, day, start, end, Course(name, place, color))
                 manualCourses = manualCourses + newCourse
                 saveCourses(context, manualCourses)
+                scheduleClassReminders(context, initialCourses + manualCourses)
                 showAddDialog = false
             },
         )
