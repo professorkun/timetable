@@ -62,6 +62,7 @@ import java.io.ByteArrayInputStream
 import java.util.zip.InflaterInputStream
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Calendar
 
 /**
  * 课程表的列标题。一周固定显示七天，即使周末暂时没有课程也保留空格。
@@ -71,6 +72,19 @@ private val weekdays = listOf("周一", "周二", "周三", "周四", "周五", 
 /** 每天显示 12 节课；表格循环与添加表单都共用这个范围。 */
 private const val PERIOD_COUNT = 12
 private const val TOTAL_WEEKS = 17
+
+/** 当前学期第 1 周的周一；后续周次的月日会从这里自动计算。 */
+private const val SEMESTER_START_YEAR = 2026
+private const val SEMESTER_START_MONTH = Calendar.AUGUST
+private const val SEMESTER_START_DAY = 31
+
+private fun dateLabel(week: Int, day: Int): String {
+    val date = Calendar.getInstance().apply {
+        set(SEMESTER_START_YEAR, SEMESTER_START_MONTH, SEMESTER_START_DAY)
+        add(Calendar.DAY_OF_YEAR, (week - 1) * weekdays.size + day - 1)
+    }
+    return "${date.get(Calendar.MONTH) + 1}月${date.get(Calendar.DAY_OF_MONTH)}日"
+}
 
 /**
  * 原始 Excel 以“1-2 节、3-4 节……”为一组记录时间。
@@ -251,6 +265,7 @@ fun TimetableApp() {
         ) { displayedWeek ->
             TimetableGrid(
                 courses = courses.filter { it.week == displayedWeek },
+                week = displayedWeek,
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding)
@@ -296,26 +311,32 @@ fun TimetableApp() {
 }
 
 @Composable
-private fun TimetableGrid(courses: List<CourseEntry>, modifier: Modifier = Modifier) {
+private fun TimetableGrid(courses: List<CourseEntry>, week: Int, modifier: Modifier = Modifier) {
     // 使用可滚动的纵向容器：课程节次增多时，用户可以向下查看。
     Column(
         modifier = modifier.verticalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
         // 先显示星期栏；下方按“星期列”绘制，连续课程可合并成一张加高卡片。
-        WeekdayHeader()
+        WeekdayHeader(week)
         Spacer(Modifier.height(periodGap))
         TimetableBody(courses)
     }
 }
 
 @Composable
-private fun WeekdayHeader() {
+private fun WeekdayHeader(week: Int) {
     // Row 让七个星期标题横向排列；左侧预留位置与下面的节次标签对齐。
     Row(Modifier.fillMaxWidth()) {
         Box(Modifier.size(width = 42.dp, height = 40.dp))
         weekdays.forEach { weekday ->
             Box(Modifier.size(width = 46.dp, height = 40.dp), contentAlignment = Alignment.Center) {
-                Text(weekday, style = MaterialTheme.typography.labelLarge)
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(weekday, style = MaterialTheme.typography.labelLarge)
+                    Text(
+                        text = dateLabel(week, weekdays.indexOf(weekday) + 1),
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
             }
         }
     }
