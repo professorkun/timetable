@@ -1,10 +1,19 @@
 package com.example.timetable
 
 import android.os.Bundle
+import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -33,17 +42,22 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.example.timetable.ui.theme.TimetableTheme
+import java.io.ByteArrayInputStream
+import java.util.zip.InflaterInputStream
 
 /**
  * 课程表的列标题。一周固定显示七天，即使周末暂时没有课程也保留空格。
@@ -52,6 +66,22 @@ private val weekdays = listOf("周一", "周二", "周三", "周四", "周五", 
 
 /** 每天显示 12 节课；表格循环与添加表单都共用这个范围。 */
 private const val PERIOD_COUNT = 12
+private const val TOTAL_WEEKS = 17
+
+/**
+ * 原始 Excel 以“1-2 节、3-4 节……”为一组记录时间。
+ * 每节都显示完整的上课区间，方便快速判断一节课的实际开始和结束时刻。
+ */
+private val periodTimeLabels = listOf(
+    "08:30-09:15", "09:20-10:05", "10:25-11:10", "11:15-12:00",
+    "14:00-14:45", "14:50-15:35", "15:45-16:30", "16:35-17:20",
+    "18:00-18:45", "18:45-19:30", "19:30-20:15", "20:15-21:00",
+)
+
+/** 单节课的高度与节次间距。课表以 2 或 4 节连排为主，因此采用更紧凑的尺寸。 */
+private val periodHeight = 62.dp
+private val periodGap = 4.dp
+private val timetableHeight = periodHeight * PERIOD_COUNT + periodGap * (PERIOD_COUNT - 1)
 
 /**
  * 一门课程在界面展示所需的最小数据。
@@ -62,28 +92,47 @@ private data class Course(val name: String, val place: String, val color: Color)
 
 /** 一次上课安排：同一门课可以覆盖同一天的连续多个节次。 */
 private data class CourseEntry(
+    val week: Int,
     val day: Int,
     val startPeriod: Int,
     val endPeriod: Int,
     val course: Course,
 )
 
-/**
- * 当前用于演示布局的固定课程数据。
- * 键的格式为“星期序号-节次”，例如“1-1”表示周一第 1 节。
- * 真实课程保存功能完成后，这里会由本地数据库中的数据替代。
- */
-private val initialCourses = listOf(
-    CourseEntry(1, 1, 1, Course("离散数学", "B-302", Color(0xFFDCEBFF))),
-    CourseEntry(2, 2, 2, Course("数据库原理", "机房 406", Color(0xFFE0F5E9))),
-    CourseEntry(3, 3, 3, Course("计算机组成原理", "A-201", Color(0xFFFFE9C8))),
-    CourseEntry(4, 4, 4, Course("英语", "C-105", Color(0xFFF2E2FF))),
-    CourseEntry(5, 5, 5, Course("体育", "田径场", Color(0xFFFFE1E5))),
-)
-
 private val courseColors = listOf(
     Color(0xFFDCEBFF), Color(0xFFE0F5E9), Color(0xFFFFE9C8), Color(0xFFF2E2FF), Color(0xFFFFE1E5),
 )
+
+private val courseCatalog = listOf(
+    "计算机组成原理|11-411", "大学英语B|11-107", "数据库应用技术|11-110", "大学英语B|11-607",
+    "数据库应用技术|11-511", "编译技术|11-210", "编译技术|11-110", "计算机组成原理|11-210",
+    "离散数学A|11-202", "工程数学|11-405", "体能训练测试1|田径场", "Web开发技术|11-211",
+    "Web开发技术|11-211", "数据库应用技术|信-105", "编译技术|信-105", "数据库应用技术|信-105",
+    "Web开发技术|信-401", "Web开发技术|信-105", "计算机组成原理|信-401", "离散数学A|信-401",
+    "嵌入式接口技术|11-211", "数据库应用技术|信-401", "Python程序设计与应用A|11-202",
+    "Python程序设计与应用A|11-202", "嵌入式接口技术|信-105", "Python程序设计与应用A|信-401",
+)
+
+/**
+ * 从用户提供的 17 周 Excel 课表提取并压缩后的固定数据。
+ *
+ * 必须放在课程目录 [courseCatalog] 的后面初始化：导入时需要先按编号查目录。
+ * 这样应用启动时课程目录已经准备完成，不会出现空指针崩溃。
+ */
+private val initialCourses = loadImportedCourses()
+
+private fun loadImportedCourses(): List<CourseEntry> {
+    val encoded = "eNrFk1sSwiAMRTeUjyYQWoatuAb3/2l4WJ0gLVQcv24m0HvyoAgIBEugpBhMUgo2qQkIBixYyUdlyUd1gZOucs7gYJPvo3o5z8o5f7tjJ4CK8RnAiG6AyziJcx4rZO4N6ffNVaQGoe3cdNROCF7SgKb2Oh3I9Dl8P/qydqvZe58sV3Lk/vAUgsv1rTPYwzN4wt+GYUs08Eh7+f6Iv0pA8efcg2Ydmn+MJfywekVr9qqbJdO92K6WxjGlKTvGUxziF+g6oNs27X6S724zWo66/QAOG1YB"
+    val rows = InflaterInputStream(ByteArrayInputStream(Base64.decode(encoded, Base64.DEFAULT))).bufferedReader().use { it.readText() }
+    // 压缩文本以字符“\\n”分隔每一周；不能用 lineSequence()，否则它会被当作同一行。
+    return rows.split("\\n").asSequence().flatMapIndexed { weekIndex, line ->
+        line.split(';').asSequence().filter { it.isNotBlank() }.map { item ->
+            val (day, start, end, catalogIndex) = item.split(',').map { it.toInt() }
+            val (name, place) = courseCatalog[catalogIndex].split('|', limit = 2)
+            CourseEntry(weekIndex + 1, day, start, end, Course(name, place, courseColors[catalogIndex % courseColors.size]))
+        }
+    }.toList()
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -100,6 +149,9 @@ fun TimetableApp() {
     // 目前课程只保存在运行内存中；下一阶段会替换为本地数据库中的数据。
     var courses by remember { mutableStateOf(initialCourses) }
     var showAddDialog by remember { mutableStateOf(false) }
+    var currentWeek by remember { mutableStateOf(1) }
+    // 拖动中的实时位移，让课表跟随手指移动；松手后归零并交给周次切换动画收尾。
+    var dragOffset by remember { mutableFloatStateOf(0f) }
 
     // Scaffold 提供页面的基础布局：顶部标题栏、主体内容区和右下角浮动按钮。
     Scaffold(
@@ -109,7 +161,7 @@ fun TimetableApp() {
                     Column {
                         // 第一行是页面名称；第二行显示当前学期和周次。
                         Text("我的课程表", fontWeight = FontWeight.Bold)
-                        Text("2026-2027 学年第一学期 · 第 1 周", style = MaterialTheme.typography.labelMedium)
+                        Text("2026-2027 学年第一学期 · 第 $currentWeek 周", style = MaterialTheme.typography.labelMedium)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -123,7 +175,55 @@ fun TimetableApp() {
         },
     ) { innerPadding ->
         // innerPadding 会避开顶部栏和系统区域，防止课程表被遮住。
-        TimetableGrid(courses, Modifier.fillMaxSize().padding(innerPadding))
+        // AnimatedContent 根据周次变化方向，让下一周从右向左、上一周从左向右滑入。
+        AnimatedContent(
+            targetState = currentWeek,
+            transitionSpec = {
+                val goToNextWeek = targetState > initialState
+                (
+                    slideInHorizontally(
+                        initialOffsetX = { fullWidth -> if (goToNextWeek) fullWidth else -fullWidth },
+                        animationSpec = tween(280),
+                    ) + fadeIn(animationSpec = tween(280))
+                ).togetherWith(
+                    slideOutHorizontally(
+                        targetOffsetX = { fullWidth -> if (goToNextWeek) -fullWidth else fullWidth },
+                        animationSpec = tween(280),
+                    ) + fadeOut(animationSpec = tween(180)),
+                )
+            },
+            label = "weekSwitchAnimation",
+        ) { displayedWeek ->
+            TimetableGrid(
+                courses = courses.filter { it.week == displayedWeek },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+                    // graphicsLayer 直接使用当前拖动距离，因此移动没有等待动画的延迟。
+                    .graphicsLayer { translationX = dragOffset }
+                    // 横向拖动超过阈值才切换，避免普通的手指抖动误触发换周。
+                    .pointerInput(displayedWeek) {
+                        var totalDrag = 0f
+                        detectHorizontalDragGestures(
+                            onDragStart = { totalDrag = 0f },
+                            onHorizontalDrag = { change, dragAmount ->
+                                change.consume()
+                                totalDrag += dragAmount
+                                // 限制最大跟手距离，避免把整个表格拖离屏幕太远。
+                                dragOffset = (dragOffset + dragAmount).coerceIn(-280f, 280f)
+                            },
+                            onDragEnd = {
+                                when {
+                                    totalDrag < -120f -> currentWeek = (currentWeek + 1).coerceAtMost(TOTAL_WEEKS)
+                                    totalDrag > 120f -> currentWeek = (currentWeek - 1).coerceAtLeast(1)
+                                }
+                                dragOffset = 0f
+                            },
+                            onDragCancel = { dragOffset = 0f },
+                        )
+                    },
+            )
+        }
     }
 
     if (showAddDialog) {
@@ -131,7 +231,7 @@ fun TimetableApp() {
             onDismiss = { showAddDialog = false },
             onSave = { name, place, day, start, end ->
                 val color = courseColors[courses.size % courseColors.size]
-                courses = courses + CourseEntry(day, start, end, Course(name, place, color))
+                courses = courses + CourseEntry(currentWeek, day, start, end, Course(name, place, color))
                 showAddDialog = false
             },
         )
@@ -146,7 +246,7 @@ private fun TimetableGrid(courses: List<CourseEntry>, modifier: Modifier = Modif
     ) {
         // 先显示星期栏；下方按“星期列”绘制，连续课程可合并成一张加高卡片。
         WeekdayHeader()
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(periodGap))
         TimetableBody(courses)
     }
 }
@@ -177,19 +277,25 @@ private fun TimetableBody(courses: List<CourseEntry>) {
 
 @Composable
 private fun PeriodColumn() {
-    Column(Modifier.size(width = 42.dp, height = 1170.dp)) {
+    Column(Modifier.size(width = 42.dp, height = timetableHeight)) {
         (1..PERIOD_COUNT).forEach { period ->
-            Box(Modifier.size(width = 42.dp, height = 92.dp), contentAlignment = Alignment.Center) {
-                Text("第${period}节", textAlign = TextAlign.Center, style = MaterialTheme.typography.labelSmall)
+            Box(Modifier.size(width = 42.dp, height = periodHeight), contentAlignment = Alignment.Center) {
+                // 时间不足一行时，只允许在“-”后换行：例如“08:30-”与“09:15”，不会截断数字。
+                Text(
+                    text = "第${period}节\n${periodTimeLabels[period - 1].replace("-", "-\u200B")}",
+                    textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 3,
+                )
             }
-            if (period < PERIOD_COUNT) Spacer(Modifier.height(6.dp))
+            if (period < PERIOD_COUNT) Spacer(Modifier.height(periodGap))
         }
     }
 }
 
 @Composable
 private fun DayColumn(day: Int, courses: List<CourseEntry>) {
-    Column(Modifier.size(width = 46.dp, height = 1170.dp)) {
+    Column(Modifier.size(width = 46.dp, height = timetableHeight)) {
         var period = 1
         while (period <= PERIOD_COUNT) {
             // 只在课程开始节次绘制卡片，并跳过它覆盖的后续节次。
@@ -202,7 +308,7 @@ private fun DayColumn(day: Int, courses: List<CourseEntry>) {
                 CourseCell(course = entry.course, span = span)
                 period += span
             }
-            if (period <= PERIOD_COUNT) Spacer(Modifier.height(6.dp))
+            if (period <= PERIOD_COUNT) Spacer(Modifier.height(periodGap))
         }
     }
 }
@@ -261,7 +367,7 @@ private fun AddCourseDialog(
 @Composable
 private fun CourseCell(course: Course?, span: Int) {
     // span 是课程覆盖的连续节次数；一张卡片会占据这些节次及它们之间的间距。
-    val cellHeight = 92.dp * span + 6.dp * (span - 1)
+    val cellHeight = periodHeight * span + periodGap * (span - 1)
     Box(Modifier.size(width = 46.dp, height = cellHeight).padding(horizontal = 2.dp)) {
         if (course == null) {
             // 没有课程时显示淡色空格，保留表格结构，方便后续点击添加。
@@ -275,7 +381,12 @@ private fun CourseCell(course: Course?, span: Int) {
             ) {
                 Column(Modifier.padding(5.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                     Text(course.name, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
-                    Text(course.place, style = MaterialTheme.typography.labelSmall)
+                    // 例如“11-411”在空间充足时保持一行；空间不足时，零宽空格允许它只在“-”后换行。
+                    Text(
+                        text = course.place.replace("-", "-\u200B"),
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 2,
+                    )
                 }
             }
         }
