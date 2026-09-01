@@ -2,6 +2,7 @@ package com.example.timetable
 
 import android.os.Bundle
 import android.util.Base64
+import android.content.Context
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -46,6 +47,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
@@ -58,6 +60,8 @@ import androidx.compose.ui.unit.dp
 import com.example.timetable.ui.theme.TimetableTheme
 import java.io.ByteArrayInputStream
 import java.util.zip.InflaterInputStream
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * 课程表的列标题。一周固定显示七天，即使周末暂时没有课程也保留空格。
@@ -121,6 +125,10 @@ private val courseCatalog = listOf(
  */
 private val initialCourses = loadImportedCourses()
 
+/** 本地保存手动课程使用的文件名和键名。数据只保存在本机，不会上传网络。 */
+private const val LOCAL_PREFS = "timetable_local_data"
+private const val MANUAL_COURSES_KEY = "manual_courses"
+
 private fun loadImportedCourses(): List<CourseEntry> {
     val encoded = "eNrFk1sSwiAMRTeUjyYQWoatuAb3/2l4WJ0gLVQcv24m0HvyoAgIBEugpBhMUgo2qQkIBixYyUdlyUd1gZOucs7gYJPvo3o5z8o5f7tjJ4CK8RnAiG6AyziJcx4rZO4N6ffNVaQGoe3cdNROCF7SgKb2Oh3I9Dl8P/qydqvZe58sV3Lk/vAUgsv1rTPYwzN4wt+GYUs08Eh7+f6Iv0pA8efcg2Ydmn+MJfywekVr9qqbJdO92K6WxjGlKTvGUxziF+g6oNs27X6S724zWo66/QAOG1YB"
     val rows = InflaterInputStream(ByteArrayInputStream(Base64.decode(encoded, Base64.DEFAULT))).bufferedReader().use { it.readText() }
@@ -132,6 +140,51 @@ private fun loadImportedCourses(): List<CourseEntry> {
             CourseEntry(weekIndex + 1, day, start, end, Course(name, place, courseColors[catalogIndex % courseColors.size]))
         }
     }.toList()
+}
+
+/** 从 SharedPreferences 读取上次手动添加的课程；数据损坏时返回空列表，保证 App 仍能打开。 */
+private fun loadSavedCourses(context: Context): List<CourseEntry> {
+    val text = context.getSharedPreferences(LOCAL_PREFS, Context.MODE_PRIVATE)
+        .getString(MANUAL_COURSES_KEY, null) ?: return emptyList()
+    return runCatching {
+        val json = JSONArray(text)
+        buildList {
+            for (index in 0 until json.length()) {
+                val item = json.getJSONObject(index)
+                val color = courseColors[index % courseColors.size]
+                add(
+                    CourseEntry(
+                        week = item.getInt("week"),
+                        day = item.getInt("day"),
+                        startPeriod = item.getInt("startPeriod"),
+                        endPeriod = item.getInt("endPeriod"),
+                        course = Course(item.getString("name"), item.getString("place"), color),
+                    ),
+                )
+            }
+        }
+    }.getOrDefault(emptyList())
+}
+
+/** 把手动课程序列化为简单 JSON，应用重启后可以恢复。 */
+private fun saveCourses(context: Context, courses: List<CourseEntry>) {
+    val json = JSONArray()
+    courses.forEach { entry ->
+        json.put(
+            JSONObject().apply {
+                put("week", entry.week)
+                put("day", entry.day)
+                put("startPeriod", entry.startPeriod)
+                put("endPeriod", entry.endPeriod)
+                put("name", entry.course.name)
+                put("place", entry.course.place)
+            },
+        )
+    }
+    context.getSharedPreferences(LOCAL_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(MANUAL_COURSES_KEY, json.toString())
+        .apply()
 }
 
 class MainActivity : ComponentActivity() {
@@ -146,8 +199,10 @@ class MainActivity : ComponentActivity() {
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 fun TimetableApp() {
-    // 目前课程只保存在运行内存中；下一阶段会替换为本地数据库中的数据。
-    var courses by remember { mutableStateOf(initialCourses) }
+    val context = LocalContext.current
+    // 固定导入课表与用户手动添加的课程分开管理；手动课程从本地恢复，重启后仍然存在。
+    var manualCourses by remember { mutableStateOf(loadSavedCourses(context)) }
+    val courses = initialCourses + manualCourses
     var showAddDialog by remember { mutableStateOf(false) }
     var currentWeek by remember { mutableStateOf(1) }
     // 拖动中的实时位移，让课表跟随手指移动；松手后归零并交给周次切换动画收尾。
@@ -230,8 +285,10 @@ fun TimetableApp() {
         AddCourseDialog(
             onDismiss = { showAddDialog = false },
             onSave = { name, place, day, start, end ->
-                val color = courseColors[courses.size % courseColors.size]
-                courses = courses + CourseEntry(currentWeek, day, start, end, Course(name, place, color))
+                val color = courseColors[manualCourses.size % courseColors.size]
+                val newCourse = CourseEntry(currentWeek, day, start, end, Course(name, place, color))
+                manualCourses = manualCourses + newCourse
+                saveCourses(context, manualCourses)
                 showAddDialog = false
             },
         )
